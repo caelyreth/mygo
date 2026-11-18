@@ -1092,6 +1092,57 @@ func TestTransitionPinsSubtreeToRestingPixels(t *testing.T) {
 	}
 }
 
+// What a transition moves paints on its opaque background as at rest,
+// with the subpixel glyphs text rests with (ClearType on Windows), under
+// the remainder that pins it to its resting pixels; what translates
+// itself inside it still paints gray.
+func TestTransitionPinKeepsTextOpaque(t *testing.T) {
+	tr := ElementTransition{Duration: 150 * time.Millisecond, Ease: Linear, Position: true}
+	x := float32(20)
+	opaque := map[string]bool{}
+	probe := func(c *context, name string) *node {
+		return coreBox(c).Size(10, 10).Draw(func(p *Painter, r Rect) { opaque[name] = p.opaque })
+	}
+	tt, now := clockTester(func(c *context) {
+		coreBox(c).Size(320, 160).Children(func() {
+			coreRow(c).Key("card").Absolute().Left(x).Top(20).Transition(tr).Children(func() {
+				probe(c, "pinned")
+				coreText(c, "W iii").FontSize(14).TextColor(RGB(0, 0, 0))
+				coreColumn(c).Translate(0.25, 0).Children(func() { probe(c, "translated") })
+			})
+		})
+	}, 320, 160)
+	tt.SetScale(2)
+	tt.Frame()
+
+	x = 33.3
+	tt.Frame()
+	pins := 0
+	for range 12 {
+		*now = now.Add(16 * time.Millisecond)
+		clear(opaque)
+		tt.Frame()
+		if ops := glyphOps(&tt.rt.scene); len(ops) == 1 && ops[0].Transform.Set {
+			pins++
+			if !opaque["pinned"] {
+				t.Errorf("frame %d: text under its transition's pin paints without its opaque background", pins)
+			}
+		}
+		if got, ok := opaque["translated"]; !ok || got {
+			t.Errorf("frame %d: text translated inside the moving element: opaque %v (painted %v), want false", pins, got, ok)
+		}
+		if !tt.rt.animating {
+			break
+		}
+	}
+	if pins == 0 {
+		t.Fatal("no moving frame carried a pin")
+	}
+	if !opaque["pinned"] {
+		t.Error("text at rest paints without its opaque background")
+	}
+}
+
 // Interrupting a moving element to Exit pins the exiting ghost to its starting
 // position without jumping from the prior frame's pin translation.
 func TestTransitionExitPinsMovingGhost(t *testing.T) {

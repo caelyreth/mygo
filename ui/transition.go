@@ -894,6 +894,7 @@ func (r *transition) apply(e *node, s tbox) {
 		e.transform = e.transform.Then(t)
 	}
 	if rx != 0 || ry != 0 {
+		e.pinned = !e.transform.set()
 		e.transform = e.transform.Then(Transform{m: scene.Translation(rx, ry)})
 	}
 	if s.blur > 0 {
@@ -972,7 +973,11 @@ func (rt *engine) animateExits(root *node, now time.Time, still, instant bool) {
 				r.opacity = e.opacity / max(r.shown.alpha, 0.001)
 			}
 			r.turn = r.ghost.transform
-			if r.pin != (Point{}) {
+			switch {
+			case r.ghost.pinned:
+				// Only its pin, which the ghost's own takes over.
+				r.turn = Transform{}
+			case r.pin != (Point{}):
 				r.turn = r.turn.Then(Transform{m: scene.Translation(-r.pin.X, -r.pin.Y)})
 			}
 			// Its own blur, without its transition's.
@@ -1033,7 +1038,9 @@ func (rt *engine) animateExits(root *node, now time.Time, still, instant bool) {
 		if t, ok := s.turn(); ok {
 			g.transform = g.transform.Then(t)
 		}
+		g.pinned = false
 		if rx != 0 || ry != 0 {
+			g.pinned = !g.transform.set()
 			g.transform = g.transform.Then(Transform{m: scene.Translation(rx, ry)})
 		}
 		g.blur = r.blur
