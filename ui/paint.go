@@ -55,10 +55,6 @@ type Painter struct {
 	// stays where the element is, so the copy's hole tells nothing of how
 	// opaque the page shows.
 	copying bool
-	// moveOrigin is the subpixel remainder carried on the scene transform
-	// while the element painting moves across frames, so its text paints
-	// locked to its starting pixel phase and translates smoothly on the GPU.
-	moveOrigin Point
 }
 
 // opaqueBox is the box of a background an element painted, and how many
@@ -281,8 +277,8 @@ func (p *Painter) element(e *node) {
 	if e.hidden || e.lift && p.lifting != e {
 		return
 	}
-	savedTransform, savedInline, savedTheme, savedOwner, savedMove := p.transform, p.inline, p.theme, p.owner, p.moveOrigin
-	p.transform, p.inline, p.owner, p.moveOrigin = e.world, nil, e.st, Point{}
+	savedTransform, savedInline, savedTheme, savedOwner := p.transform, p.inline, p.theme, p.owner
+	p.transform, p.inline, p.owner = e.world, nil, e.st
 	if e.themed != nil {
 		p.theme = e.themed
 	}
@@ -299,7 +295,7 @@ func (p *Painter) element(e *node) {
 		built = builtStyle{e.bg, e.borderC, e.ts.color, e.opacity, e.opacitySet, e.shadows}
 	}
 	defer func() {
-		p.transform, p.inline, p.theme, p.owner, p.moveOrigin = savedTransform, savedInline, savedTheme, savedOwner, savedMove
+		p.transform, p.inline, p.theme, p.owner = savedTransform, savedInline, savedTheme, savedOwner
 		if styled {
 			e.bg, e.borderC, e.ts.color, e.opacity, e.opacitySet, e.shadows = built.bg, built.border, built.text, built.opacity, built.opacitySet, built.shadows
 		}
@@ -396,7 +392,6 @@ func (p *Painter) element(e *node) {
 		own = p.inlineVisible(e)
 	}
 	if own {
-		p.moveOrigin = p.originRemainder(e)
 		for _, sh := range e.shadows {
 			if !sh.inset {
 				p.shadow(box, e.radius, sh)
@@ -1007,19 +1002,6 @@ func (p *Painter) textForeground(l *text.Layout, x, y float32, color Color, ts t
 	if l == nil {
 		return
 	}
-	hasMove := p.moveOrigin != (Point{})
-	var savedTransform scene.Affine
-	var savedOpaque bool
-	if hasMove {
-		savedTransform, savedOpaque = p.transform, p.opaque
-		x -= p.moveOrigin.X
-		y -= p.moveOrigin.Y
-		p.transform = savedTransform.Mul(scene.Translation(p.moveOrigin.X, p.moveOrigin.Y))
-		// Moving off the resting pixel grid paints with grayscale coverage,
-		// as matches.pin does, so color fringes do not shift under fractional
-		// GPU translation, then settles cleanly when motion stops.
-		p.opaque = false
-	}
 	sys := p.rt.text
 	deco := decoration{underline: ts.underline, wavy: ts.wavy, dotted: ts.dotted, strike: ts.strike, solid: ts.solid, color: ts.decoColor, thick: ts.decoThick,
 		offset: ts.decoOffset, hasOffset: ts.set&setDecoOffset != 0}
@@ -1106,9 +1088,6 @@ func (p *Painter) textForeground(l *text.Layout, x, y float32, color Color, ts t
 	}
 	if end := int32(len(p.s.Glyphs)); end > start {
 		gs.add(p, scene.Op{Kind: scene.OpGlyphs, Start: start, End: end})
-	}
-	if hasMove {
-		p.transform, p.opaque = savedTransform, savedOpaque
 	}
 }
 

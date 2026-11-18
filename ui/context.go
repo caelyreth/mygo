@@ -791,9 +791,6 @@ type state struct {
 	// scales are the scales its text and its layer rasterized at, once a
 	// transform scaled them (glyphSpace, layerScale).
 	scales *scaleWatches
-	// origin records the paint origin across consecutive frames so moving
-	// text keeps a fixed pixel phase while animating (noteMove).
-	origin originWatch
 	// ink is what the element and those inside it painted into its layer
 	// in frame inkFrame, in its own space, and lastInk what they painted
 	// in a frame before (keepInk): the layer of a frame holds lastInk, as
