@@ -452,3 +452,200 @@ func TestScaledInlineTransform(t *testing.T) {
 		t.Error("no glyph moved by the inline element's transform")
 	}
 }
+
+// TestMovedTextKeepsGlyphGridAndSettles checks that text moved by a layout
+// transition keeps its resting glyph pixel offsets and baseline invariant
+// while carrying the subpixel remainder on OpGlyphs's transform, and settles
+// back onto the frame's pixels with no trailing repaints once motion ends.
+func TestMovedTextKeepsGlyphGridAndSettles(t *testing.T) {
+	moved := false
+	var label *node
+	tt := newScaleTester(func(c *context) {
+		x, y := float32(20), float32(20)
+		if moved {
+			x, y = 33, 27
+		}
+		coreRow(c).Key("row").Absolute().Left(x).Top(y).Gap(6).AlignItems(Baseline).
+			Transition(ElementTransition{Duration: 160 * time.Millisecond, Ease: Linear, Position: true}).
+			Children(func() {
+				label = coreText(c, "Weekly report").FontSize(12).TextColor(RGB(0, 0, 0)).SingleLine()
+			})
+	}, 320, 120, 2)
+
+	if label == nil || label.st == nil {
+		t.Fatal("label not built")
+	}
+	ops := glyphOps(&tt.rt.scene)
+	if len(ops) != 1 || ops[0].Transform.Set {
+		t.Fatalf("at rest: got %d glyph ops (%+v), want 1 untransformed op", len(ops), ops)
+	}
+	restGlyphs := append([]scene.Glyph(nil), tt.rt.scene.Glyphs[ops[0].Start:ops[0].End]...)
+	if len(restGlyphs) < 4 {
+		t.Fatalf("got %d glyphs, want >= 4", len(restGlyphs))
+	}
+
+	moved = true
+	tt.rt.requestFrame()
+	tt.frame(0)
+	sawFractional := false
+	for frames := 0; tt.frame(8 * time.Millisecond); frames++ {
+		if frames > 40 {
+			t.Fatal("the transition does not end")
+		}
+		ops = glyphOps(&tt.rt.scene)
+		if len(ops) != 1 {
+			t.Fatalf("frame %d: got %d glyph ops, want 1", frames, len(ops))
+		}
+		gs := tt.rt.scene.Glyphs[ops[0].Start:ops[0].End]
+		if len(gs) != len(restGlyphs) {
+			t.Fatalf("frame %d: glyph count %d, want %d", frames, len(gs), len(restGlyphs))
+		}
+		for i, g := range gs {
+			if dx, wantDX := g.X-gs[0].X, restGlyphs[i].X-restGlyphs[0].X; math.Abs(float64(dx-wantDX)) > 1e-4 {
+				t.Errorf("frame %d glyph %d: dx = %v, want %v", frames, i, dx, wantDX)
+			}
+			if dy, wantDY := g.Y-gs[0].Y, restGlyphs[i].Y-restGlyphs[0].Y; math.Abs(float64(dy-wantDY)) > 1e-4 {
+				t.Errorf("frame %d glyph %d: dy = %v, want %v", frames, i, dy, wantDY)
+			}
+		}
+		if tr := ops[0].Transform; tr.Set {
+			sawFractional = true
+			if math.Abs(float64(tr.X)) > 0.501 || math.Abs(float64(tr.Y)) > 0.501 {
+				t.Errorf("frame %d: subpixel transform (%v, %v) exceeds half pixel", frames, tr.X, tr.Y)
+			}
+			for i, g := range gs {
+				if g.Subpixel {
+					t.Errorf("frame %d glyph %d: moving with subpixel transform wants grayscale coverage", frames, i)
+				}
+			}
+		}
+	}
+	if !sawFractional {
+		t.Error("never observed a fractional OpGlyphs translation during transition")
+	}
+	ops = glyphOps(&tt.rt.scene)
+	if len(ops) != 1 || ops[0].Transform.Set {
+		t.Errorf("after settling: got %+v, want untransformed OpGlyphs", ops)
+	}
+	if label.st.origin.needSettle {
+		t.Error("origin.needSettle remained true after settling")
+	}
+	if tt.frame(8 * time.Millisecond) {
+		t.Error("at rest, the window asks for frames")
+	}
+}
+
+// TestOneShotMoveDoesNotAskExtraFrame verifies that a single non-animated layout
+// move renders settled in one frame without scheduling an extra settle frame.
+func TestOneShotMoveDoesNotAskExtraFrame(t *testing.T) {
+	y := float32(20)
+	tt := newScaleTester(func(c *context) {
+		coreText(c, "Status row").Absolute().Left(20).Top(y).FontSize(14).TextColor(RGB(0, 0, 0))
+	}, 240, 100, 1)
+	y = 20.37
+	tt.rt.requestFrame()
+	if tt.frame(0) {
+		t.Error("one-shot non-animated move requested an extra frame")
+	}
+	if ops := glyphOps(&tt.rt.scene); len(ops) != 1 || ops[0].Transform.Set {
+		t.Errorf("one-shot move emitted %+v, want settled glyphs", ops)
+	}
+}
+
+// TestSmallShrinkAnimationKeepsUnitGlyphScale checks that animations
+// scaling within minUnitShrinkScale..1 keep rasterizing glyphs at the
+// unscaled atlas rather than thrashing buckets mid-motion, while still
+// settling to an exact non-unit rest scale once motion stops.
+func TestSmallShrinkAnimationKeepsUnitGlyphScale(t *testing.T) {
+	settled := false
+	var text *node
+	tt := newScaleTester(func(c *context) {
+		p := Pose{Scale: 0.9}
+		if settled {
+			p = Pose{Scale: 1}
+		}
+		coreBox(c).Absolute().Left(40).Top(40).TransformOrigin(0, 0).
+			AnimatePose(p, Animation{Duration: 160 * time.Millisecond, Ease: Linear}).
+			Children(func() {
+				text = coreText(c, "Bounce").FontSize(18)
+			})
+	}, 300, 140, 1)
+
+	settled = true
+	tt.rt.requestFrame()
+	tt.frame(0)
+	for frames := 0; tt.frame(8 * time.Millisecond); frames++ {
+		if frames > 40 {
+			t.Fatal("the animation does not end")
+		}
+		k := transformScale(text.st.world, 0, 0)
+		q, _ := rasterScaleOf(t, &tt.rt.scene, k)
+		if q != 1 {
+			t.Errorf("frame %d (k=%v): rasterized at q=%v, want 1 during 0.90->1 animation", frames, k, q)
+		}
+	}
+	if tt.frame(8 * time.Millisecond) {
+		t.Error("at rest, the window asks for frames")
+	}
+
+	// Shrinking 1.0 -> 0.90 stays at q=1 while changing, then settles to 0.90.
+	settled = false
+	tt.rt.requestFrame()
+	tt.frame(0)
+	for frames := 0; tt.frame(8 * time.Millisecond); frames++ {
+		if frames > 40 {
+			t.Fatal("the shrink animation does not end")
+		}
+		k := transformScale(text.st.world, 0, 0)
+		q, _ := rasterScaleOf(t, &tt.rt.scene, k)
+		if k > 0.9001 && q != 1 {
+			t.Errorf("shrink frame %d (k=%v): rasterized at q=%v, want 1", frames, k, q)
+		}
+	}
+	k := transformScale(text.st.world, 0, 0)
+	q, screen := rasterScaleOf(t, &tt.rt.scene, k)
+	if math.Abs(float64(q-0.9)) > 1e-4 || !screen {
+		t.Errorf("at rest after shrink: rasterized at q=%v screen=%v, want 0.9 screen=true", q, screen)
+	}
+	if tt.frame(8 * time.Millisecond) {
+		t.Error("at rest after shrink, the window asks for frames")
+	}
+}
+
+// TestConsecutiveLayoutMovesLockGlyphGrid checks that repeated non-animated
+// layout moves across consecutive frames lock relative glyph spacing without
+// requesting extra settle frames per step.
+func TestConsecutiveLayoutMovesLockGlyphGrid(t *testing.T) {
+	var dx, dy float32
+	tt := newScaleTester(func(c *context) {
+		coreText(c, "W iii").Absolute().Left(20 + dx).Top(20 + dy).FontSize(12).TextColor(RGB(0, 0, 0)).SingleLine()
+	}, 240, 100, 2)
+
+	// Step 1 anchors non-animated consecutive tracking; steps 2..N stay locked.
+	dx, dy = 0.11, 0.11
+	tt.rt.requestFrame()
+	if tt.frame(0) {
+		t.Fatal("first step requested extra frame")
+	}
+	ops := glyphOps(&tt.rt.scene)
+	base := append([]scene.Glyph(nil), tt.rt.scene.Glyphs[ops[0].Start:ops[0].End]...)
+
+	for step := 2; step <= 10; step++ {
+		dx = float32(step) * 0.11
+		dy = float32(step) * 0.11
+		tt.rt.requestFrame()
+		if tt.frame(0) {
+			t.Fatalf("step %d requested an extra frame", step)
+		}
+		ops = glyphOps(&tt.rt.scene)
+		gs := tt.rt.scene.Glyphs[ops[0].Start:ops[0].End]
+		for i, g := range gs {
+			if got, want := g.X-gs[0].X, base[i].X-base[0].X; math.Abs(float64(got-want)) > 1e-4 {
+				t.Errorf("step %d glyph %d: dx = %v, want %v", step, i, got, want)
+			}
+			if got, want := g.Y-gs[0].Y, base[i].Y-base[0].Y; math.Abs(float64(got-want)) > 1e-4 {
+				t.Errorf("step %d glyph %d: dy = %v, want %v", step, i, got, want)
+			}
+		}
+	}
+}

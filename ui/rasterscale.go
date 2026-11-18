@@ -93,6 +93,83 @@ type scaleWatches struct {
 	text, layer scaleWatch
 }
 
+// originWatch records the paint origin of an element across frames so
+// that moving text keeps a fixed pixel phase while animating and settles
+// back cleanly once motion ends.
+type originWatch struct {
+	movingFrame uint64
+	anchorX     float32
+	anchorY     float32
+	consecutive bool
+	needSettle  bool
+}
+
+// noteMove records that s's paint origin moved from (prevX, prevY) to
+// (nx, ny) on frame. When an animation is already running, (prevX, prevY)
+// anchors the glyph grid from the first moving frame; otherwise (nx, ny)
+// anchors subsequent consecutive frames so one-shot layout changes render
+// settled immediately.
+func (s *state) noteMove(frame uint64, animating bool, prevX, prevY, nx, ny float32) {
+	w := &s.origin
+	if w.movingFrame != 0 && w.movingFrame+1 == frame {
+		w.consecutive = true
+	} else {
+		w.consecutive = false
+		if animating {
+			w.anchorX, w.anchorY = prevX, prevY
+		} else {
+			w.anchorX, w.anchorY = nx, ny
+		}
+	}
+	w.movingFrame = frame
+}
+
+// minUnitShrinkScale is the lower scale bound down to which an animated
+// shrink keeps using the unscaled glyph atlas instead of swapping to a
+// smaller bucket and back mid-motion.
+const minUnitShrinkScale = 0.85
+
+func unitShrink(k float32) bool {
+	return k >= minUnitShrinkScale && k <= 1
+}
+
+// originRemainder returns the subpixel paint offset to carry on OpGlyphs's
+// transform while e's paint origin moves across frames, scheduling a clean
+// settled repaint when an active animation finishes.
+func (p *Painter) originRemainder(e *node) Point {
+	w := &e.st.origin
+	if w.movingFrame != p.rt.frame || (!w.consecutive && !p.rt.animating) {
+		if w.needSettle {
+			w.needSettle = false
+		}
+		return Point{}
+	}
+	ox, oy := e.x+e.contentX(), e.y+e.contentY()
+	s := p.scale
+	if p.transform.Set {
+		if k := transformScale(p.transform, ox, oy); !unscaled(k) && !unitShrink(k) {
+			s *= min(k, maxRasterScale)
+		}
+	}
+	if s <= 0 {
+		return Point{}
+	}
+	_, lx := snapTo(ox, w.anchorX, s)
+	_, ly := snapTo(oy, w.anchorY, s)
+	if lx == 0 && ly == 0 {
+		if w.needSettle && !p.rt.animating {
+			w.needSettle = false
+		}
+		return Point{}
+	}
+	if p.rt.animating || w.needSettle {
+		w.needSettle = true
+		p.rt.repainting = true
+		p.asks()
+	}
+	return Point{lx, ly}
+}
+
 // scaleWatch tells whether the scale of what an element draws changed
 // since the frame before it drew it: k in frame, last in the one before,
 // and, for a layer, where its transform put its origin in each (at,
@@ -124,6 +201,10 @@ func (p *Painter) rasterScale(w *scaleWatch, k, most float32, at [2]float32) (q 
 	k = max(k, minRasterScale)
 	most = min(max(most, 1), maxRasterScale)
 	exact = true
+	// A modest shrink animation (e.g. 0.90 -> 1.0 press/enter bounce) keeps
+	// the unscaled atlas while changing rather than rasterizing a slightly
+	// smaller bucket and swapping back to 1 mid-motion.
+	keepUnit := false
 	if w != nil {
 		first := w.note(p.rt.paintFrames, k, at)
 		last := w.last
@@ -131,9 +212,10 @@ func (p *Painter) rasterScale(w *scaleWatch, k, most float32, at [2]float32) (q 
 			last = 1 // unscaled until now, as no transform scaled it
 		}
 		exact = last == 0 || last == k
-		if !exact && first && !unscaled(k) && scaleBucket(k) != k {
-			// Drawn at its bucket while it changes: at k itself once it
-			// stays.
+		keepUnit = !exact && unitShrink(k)
+		if !exact && first && !unscaled(k) && (keepUnit || scaleBucket(k) != k) {
+			// Drawn at its bucket (or 1 for small shrinks) while it
+			// changes: at k itself once it stays.
 			p.rt.repainting = true
 			p.asks()
 		}
@@ -141,8 +223,11 @@ func (p *Painter) rasterScale(w *scaleWatch, k, most float32, at [2]float32) (q 
 		// No element tells whether it changes, as for a canvas's
 		// drawing: its bucket, which does not.
 		exact = false
+		keepUnit = unitShrink(k)
 	}
-	if !exact {
+	if keepUnit {
+		k = 1
+	} else if !exact {
 		k = scaleBucket(k)
 	}
 	if unscaled(k) {
@@ -180,6 +265,9 @@ type glyphSpace struct {
 // in the painter's pixels, at its scale, as they always did.
 func (p *Painter) glyphSpace(l *text.Layout, x, y float32, moves bool) glyphSpace {
 	if !p.transform.Set || l == nil {
+		if l != nil && p.owner != nil && p.owner.scales != nil && p.owner.scales.text.frame != 0 {
+			p.owner.scales.text.note(p.rt.paintFrames, 1, [2]float32{})
+		}
 		return glyphSpace{scale: p.scale, q: 1}
 	}
 	return p.glyphSpaceAt(x+l.Width/2, y+l.Height/2, l.Params.Style.FontSize(), moves)
@@ -193,7 +281,7 @@ func (p *Painter) glyphSpaceAt(x, y, size float32, moves bool) glyphSpace {
 		return gs
 	}
 	k := transformScale(m, x, y)
-	if unscaled(k) && (p.owner == nil || p.owner.scales == nil) {
+	if unscaled(k) && (p.owner == nil || p.owner.scales == nil || p.owner.scales.text.frame == 0) {
 		return gs // turned or moved, as ever: nothing to watch
 	}
 	var w *scaleWatch
@@ -209,7 +297,7 @@ func (p *Painter) glyphSpaceAt(x, y, size float32, moves bool) glyphSpace {
 		return gs
 	}
 	gs.scale, gs.q = p.scale*q, q
-	if exact && !moves && m.A == q && m.D == q && m.B == 0 && m.C == 0 && !m.Perspective() {
+	if exact && !moves && p.moveOrigin == (Point{}) && m.A == q && m.D == q && m.B == 0 && m.C == 0 && !m.Perspective() {
 		// Only scaled by q and moved: the glyphs lie where they show.
 		gs.screen = true
 		gs.dx, gs.dy = m.X*p.scale, m.Y*p.scale
@@ -258,6 +346,9 @@ const maxLayerScaled = 4096
 func (p *Painter) layerScale(e *node, from Rect) (q float32, still bool) {
 	m := e.world
 	if !m.Set || e.effect != nil || e.blur > 0 {
+		if !m.Set && e.st.scales != nil && e.st.scales.layer.frame != 0 {
+			e.st.scales.layer.note(p.rt.paintFrames, 1, [2]float32{})
+		}
 		return 1, false
 	}
 	k := transformScale(m, e.x+e.w/2, e.y+e.h/2)

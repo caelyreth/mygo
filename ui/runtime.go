@@ -1732,7 +1732,11 @@ func (rt *engine) commitElement(e *node, clip Rect, hidden bool) {
 	vis := e.visualRect(Rect{e.x, e.y, e.w, e.h})
 	v := intersect(vis, clip)
 	s.vx, s.vy, s.vw, s.vh, s.reposed = v.X, v.Y, v.W, v.H, false
-	s.cx, s.cy = e.x+e.contentX(), e.y+e.contentY()
+	cx, cy := e.x+e.contentX(), e.y+e.contentY()
+	if s.born != rt.frame && (cx != s.cx || cy != s.cy) && (e.kind == kindText || e.kind == kindInput || e.paintFn != nil) {
+		s.noteMove(rt.frame, rt.animating, s.cx, s.cy, cx, cy)
+	}
+	s.cx, s.cy = cx, cy
 	s.cw, s.ch = max(e.w-e.padX(), 0), max(e.h-e.padY(), 0)
 	barFlags := e.flags & (flagScrollX | flagScrollY)
 	if barFlags != 0 {
